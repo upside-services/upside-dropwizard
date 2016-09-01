@@ -1,78 +1,140 @@
 package com.upside.dropwizard.commands;
 
+
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.dropwizard.Application;
 import io.dropwizard.Configuration;
-import io.dropwizard.cli.EnvironmentCommand;
-import io.dropwizard.setup.Environment;
+import io.dropwizard.cli.ServerCommand;
+import io.dropwizard.configuration.ConfigurationException;
+import io.dropwizard.configuration.ConfigurationFactory;
+import io.dropwizard.configuration.ConfigurationFactoryFactory;
+import io.dropwizard.configuration.ConfigurationSourceProvider;
+import io.dropwizard.setup.Bootstrap;
 import net.sourceforge.argparse4j.inf.Namespace;
-import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.util.component.AbstractLifeCycle;
-import org.eclipse.jetty.util.component.LifeCycle;
+import net.sourceforge.argparse4j.inf.Subparser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.validation.Validator;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+
 /**
  * Starts server on an upside ami based on the conventions here:
- *
- * <link to ami convertionas>
- *
+ * <p>
+ * <link to ami conventions>
+ * <p>
+ * <p>
+ * Your AMI must have permission via EC2 role to access the service configuration bucket.
  */
-public class AmiServerCommand <T extends Configuration> extends EnvironmentCommand<T> {
+public class AmiServerCommand<T extends Configuration> extends ServerCommand<T> {
+
     private static final Logger LOGGER = LoggerFactory.getLogger(AmiServerCommand.class);
 
-    private final Class<T> configurationClass;
+    private boolean asynchronous;
+
+    private T configuration;
+
+    private AmazonS3Client s3Client = new AmazonS3Client();
 
     public AmiServerCommand(Application<T> application) {
-        this(application, "server", "Runs the Dropwizard application as an HTTP server");
+        super(application, "ami-server", "Runs the Dropwizard application as an" +
+                " HTTP server on the upside service ami");
     }
 
     /**
-     * A constructor to allow reuse of the server command as a different name
-     * @param application the application using this command
-     * @param name the argument name to invoke this command
-     * @param description a summary of what the command does
+     * Configure the command's {@link Subparser}. <p><strong> N.B.: if you override this method, you
+     * <em>must</em> call {@code super.override(subparser)} in order to preserve the configuration
+     * file parameter in the subparser. </strong></p>
+     *
+     * @param subparser the {@link Subparser} specific to the command
      */
-    protected AmiServerCommand(final Application<T> application, final String name, final String description) {
-        super(application, name, description);
-        this.configurationClass = application.getConfigurationClass();
-    }
-
-    /*
-         * Since we don't subclass ServerCommand, we need a concrete reference to the configuration
-         * class.
-         */
     @Override
-    protected Class<T> getConfigurationClass() {
-        return configurationClass;
+    public void configure(Subparser subparser) {
+        subparser.addArgument("version")
+                .nargs("?")
+                .help("version of this deployment");
+        subparser.addArgument("tier")
+                .nargs("?")
+                .help("tier of this deployment");
     }
 
     @Override
-    protected void run(Environment environment, Namespace namespace, T configuration) throws Exception {
-        final Server server = configuration.getServerFactory().build(environment);
+    @SuppressWarnings("unchecked")
+    public void run(Bootstrap<?> wildcardBootstrap, Namespace namespace) throws Exception {
+        final Bootstrap<T> bootstrap = (Bootstrap<T>) wildcardBootstrap;
+
+        // get base s3 bucket and key from environment
+        File baseConfigurationFile = new File("/etc/upside/service/base.json");
+        if (!baseConfigurationFile.exists()) {
+            throw new RuntimeException("Base configuration file not found.");
+        }
+        BaseConfiguration baseConfiguration = bootstrap.getObjectMapper()
+                .readerFor(BaseConfiguration.class)
+                .readValue(baseConfigurationFile);
+
+        //Get the file from s3
+        String name = bootstrap.getApplication().getName();
+        String key = baseConfiguration.buildS3Key(bootstrap.getApplication().getName());
+
+        File targetPath = new File(String.format("/etc/upside/service/%s/%s/%s/config.yml",
+                name,
+                baseConfiguration.getVersion(),
+                baseConfiguration.getTier()));
+
+        if (!targetPath.exists()) {
+            try (InputStream in = s3Client.getObject(baseConfiguration.getBucket(), key)
+                    .getObjectContent()) {
+                Files.copy(in, targetPath.toPath());
+            }
+        }
+
+        configuration = parseConfiguration(bootstrap.getConfigurationFactoryFactory(),
+                bootstrap.getConfigurationSourceProvider(),
+                bootstrap.getValidatorFactory().getValidator(),
+                targetPath.getCanonicalPath(),
+                getConfigurationClass(),
+                bootstrap.getObjectMapper());
+
         try {
-            server.addLifeCycleListener(new LifeCycleListener());
-            cleanupAsynchronously();
-            server.start();
-        } catch (Exception e) {
-            LOGGER.error("Unable to start server, shutting down", e);
-            try {
-                server.stop();
-            } catch (Exception e1) {
-                LOGGER.warn("Failure during stop server", e1);
+            if (configuration != null) {
+                configuration.getLoggingFactory().configure(bootstrap.getMetricRegistry(),
+                        bootstrap.getApplication().getName());
             }
-            try {
+
+            run(bootstrap, namespace, configuration);
+        }
+        finally {
+            if (!asynchronous) {
                 cleanup();
-            } catch (Exception e2) {
-                LOGGER.warn("Failure during cleanup", e2);
             }
-            throw e;
         }
     }
 
-    private class LifeCycleListener extends AbstractLifeCycle.AbstractLifeCycleListener {
-        @Override
-        public void lifeCycleStopped(LifeCycle event) {
-            cleanup();
+    private T parseConfiguration(ConfigurationFactoryFactory<T> configurationFactoryFactory,
+                                 ConfigurationSourceProvider provider,
+                                 Validator validator,
+                                 String path,
+                                 Class<T> klass,
+                                 ObjectMapper objectMapper) throws IOException, ConfigurationException {
+        final ConfigurationFactory<T> configurationFactory = configurationFactoryFactory
+                .create(klass, validator, objectMapper, "dw");
+        if (path != null) {
+            return configurationFactory.build(provider, path);
+        }
+        return configurationFactory.build();
+    }
+
+    protected void cleanupAsynchronously() {
+        this.asynchronous = true;
+    }
+
+    protected void cleanup() {
+        if (configuration != null) {
+            configuration.getLoggingFactory().stop();
         }
     }
 }
